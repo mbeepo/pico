@@ -3,10 +3,8 @@
 
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_rp::{bind_interrupts, gpio, interrupt, peripherals::PIO0, pio::{self, Common, Pio, PioPin, StateMachine}};
+use embassy_rp::{bind_interrupts, dma, gpio, interrupt, peripherals::PIO0, pio::{self, Common, Config, Instance, Pin, Pio, PioPin, StateMachine}, Peripheral};
 use embassy_time::Timer;
-use embassy_sync::mutex::Mutex;
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use fixed_macro::types::U56F8;
 use gpio::{Level, Output};
 use {defmt_rtt as _, panic_probe as _};
@@ -17,11 +15,18 @@ bind_interrupts!(struct Irqs {
 });
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     let mut led = Output::new(p.PIN_16, Level::Low);
     let mut counter: u8 = 0;
+
     let mut pio = Pio::new(p.PIO0, Irqs);
+    let segment_pins = UninitSerialPair { data: p.PIN_15, clock: p.PIN_14 };
+    let digit_pins = UninitSerialPair { data: p.PIN_13, clock: p.PIN_12 };
+    setup_7sd_task_sm0(&mut pio.common, &mut pio.sm0, segment_pins, digit_pins);
+    pio.sm0.tx().dma_push(p.DMA_CH0.into_ref(), &[0b10101010101010101010101010101010u32]).await;
+    spawner.spawn(pio_task_sm0(pio.sm0)).unwrap();
+
 
     loop {
         info!("led on!");
@@ -36,50 +41,72 @@ async fn main(_spawner: Spawner) {
     }
 }
 
-fn setup_pio_task_sm0<'a>(pio: &mut Common<'a, PIO0>, sm: &mut StateMachine<'a, PIO0, 0>,
-        segment_pins: (impl PioPin, impl PioPin, impl PioPin, impl PioPin, impl PioPin, impl PioPin, impl PioPin),
-        digit_pins: (impl PioPin, impl PioPin, impl PioPin, impl PioPin)) {
-    /*
-        Pins:
-            Out to shift register
-            Shift register clock
-            Out to shift register 2
-            Shift register 2 clock
-    */
+struct UninitSerialPair<T, U>
+        where T: PioPin, U: PioPin {
+    data: T,
+    clock: U,
+}
+
+impl<T, U> UninitSerialPair<T, U>
+        where T: PioPin, U: PioPin {
+    /// Initializes the pair as output pins for the passed state machine
+    fn init_out<'a, B: Instance>(self, pio: &mut Common<'a, B>, sm: &mut StateMachine<'a, B, 0>) -> SerialOutput<'a, B> {
+        let pins = self.init_helper(pio, sm, pio::Direction::Out);
+        SerialOutput { data: pins.0, clock: pins.1 }
+    }
+    
+    /// Initializes the pair as output pins for the passed state machine
+    fn init_in<'a, B: Instance>(self, pio: &mut Common<'a, B>, sm: &mut StateMachine<'a, B, 0>) -> SerialOutput<'a, B> {
+        let pins = self.init_helper(pio, sm, pio::Direction::In);
+        SerialOutput { data: pins.0, clock: pins.1 }
+    }
+
+    fn init_helper<'a, B: Instance, const SM: usize>(self, pio: &mut Common<'a, B>, sm: &mut StateMachine<'a, B, SM>, dir: pio::Direction) -> (Pin<'a, B>, Pin<'a, B>) {
+        let pins = (pio.make_pio_pin(self.data), pio.make_pio_pin(self.clock));
+        sm.set_pin_dirs(dir, &[&pins.0, &pins.1]);
+        pins
+    }
+}
+
+struct SerialOutput<'a, B: Instance> {
+    data: Pin<'a, B>,
+    clock: Pin<'a, B>,
+}
+
+struct SerialInput<'a, B: Instance> {
+    data: Pin<'a, B>,
+    clock: Pin<'a, B>,
+}
+
+fn setup_7sd_task_sm0<'a, ST, SU, DT, DU>(pio: &mut Common<'a, PIO0>, sm: &mut StateMachine<'a, PIO0, 0>, segment_pins: UninitSerialPair<ST, SU>, digit_pins: UninitSerialPair<DT, DU>) 
+        where ST: PioPin, SU: PioPin, DT: PioPin, DU: PioPin {
     let prog = pio_proc::pio_asm!(
-        ".wrap_target",
-        "out pins, 11 [24]",
-        "nop [24]",
-        "nop [24]",
-        "nop [24]",
-        "nop [24]",
-        ".wrap",
+        ".side_set 3 opt",
+        "start:",
+        "set x, 5 side 0b011", // decrementing at start of loop so we need to start 1 higher
+        "digit:",
+            "out null, 1",
+            "jmp x--, start side 0b001",
+            "nop [1]", // wait a couple bonus cycles just to be sure it displays
+            "nop [1]",
+            "nop [1]",
+            "set y, 8", // shift all 8 bits out and leave pin A of the segment SR unused (this is a surprise tool that will help us later)
+            ".wrap_target",
+                "out pins, 1 side 0b100"
+                "set pins, 0b000",
+                "jmp y--, digit",
+            ".wrap",
     );
-
-    let out_pins = (
-        pio.make_pio_pin(digit_pins.0), pio.make_pio_pin(digit_pins.1),
-        pio.make_pio_pin(digit_pins.2), pio.make_pio_pin(digit_pins.3),
-        pio.make_pio_pin(segment_pins.0), pio.make_pio_pin(segment_pins.1),
-        pio.make_pio_pin(segment_pins.2), pio.make_pio_pin(segment_pins.3),
-        pio.make_pio_pin(segment_pins.4), pio.make_pio_pin(segment_pins.5),
-        pio.make_pio_pin(segment_pins.6),
-    );
-
-    sm.set_pin_dirs(pio::Direction::Out, &[
-        &out_pins.0, &out_pins.1, &out_pins.2, &out_pins.3, 
-        &out_pins.4, &out_pins.5, &out_pins.6, &out_pins.7, 
-        &out_pins.8, &out_pins.9, &out_pins.10, 
-    ]);
+    
+    let segment_out = segment_pins.init_out(pio, sm);
+    let digit_out = digit_pins.init_out(pio, sm);
 
     let mut cfg = pio::Config::default();
     
     cfg.clock_divider = (U56F8!(125_000_000) / U56F8!(10_000)).to_fixed();
     cfg.use_program(&pio.load_program(&prog.program), &[]);
-    cfg.set_out_pins(&[
-        &out_pins.0, &out_pins.1, &out_pins.2, &out_pins.3, 
-        &out_pins.4, &out_pins.5, &out_pins.6, &out_pins.7, 
-        &out_pins.8, &out_pins.9, &out_pins.10, 
-    ]);
+    cfg.set_out_pins(&[&segment_out.data]);
+    cfg.set_set_pins(&[&segment_out.clock, &digit_out.data, &digit_out.clock]);
     cfg.shift_out.auto_fill = true;
     sm.set_config(&cfg);
 }

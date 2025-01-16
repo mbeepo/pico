@@ -917,6 +917,7 @@ dependencies = [
  "panic-probe",
  "pio",
  "pio-proc",
+ "rp-pac",
 ]
 
 [[package]]
