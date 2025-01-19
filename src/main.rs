@@ -1,11 +1,14 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{compiler_fence, Ordering};
+
 use embassy_executor::Spawner;
-use embassy_rp::{bind_interrupts, gpio, peripherals::PIO0, pio::{self, Common, Instance, Pin, Pio, PioPin, StateMachine}, Peripheral};
+use embassy_rp::{bind_interrupts, dma::{write_repeated, Channel, Transfer}, gpio, into_ref, peripherals::PIO0, pio::{self, Common, Instance, Pin, Pio, PioPin, ShiftConfig, ShiftDirection, StateMachine}, Peripheral};
 use embassy_time::Timer;
 use fixed_macro::types::U56F8;
 use gpio::{Level, Output};
+use rp_pac::dma::vals::{self, DataSize, TreqSel};
 use {defmt_rtt as _, panic_probe as _};
 use fixed::traits::ToFixed;
 
@@ -13,8 +16,10 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
 });
 
+const SM0_TXF0: *mut u32 = 0x50200010 as *mut u32;
+
 #[embassy_executor::main]
-async fn main(spawner: Spawner) {
+async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     let mut led = Output::new(p.PIN_16, Level::Low);
 
@@ -22,11 +27,10 @@ async fn main(spawner: Spawner) {
     let segment_pins = UninitSerialPair { data: p.PIN_15, clock: p.PIN_14 };
     let digit_pins = UninitSerialPair { data: p.PIN_13, clock: p.PIN_12 };
     setup_7sd_task_sm0(&mut pio.common, &mut pio.sm0, segment_pins, digit_pins);
+    let silly = &[0b10101010101010101010101010101010u32];
 
-    // pio.sm0.tx().dma_push(p.DMA_CH0.into_ref(), &[0b10101010101010101010101010101010u32]).await;
-    // pio.sm0.tx().dma_push(p.DMA_CH0.into_ref(), &[u32::MAX]).await;
-    
-    spawner.spawn(pio_task_sm0(pio.sm0)).unwrap();
+    unsafe { write_repeated(p.DMA_CH0, SM0_TXF0, 4, TreqSel::PERMANENT).; }
+    pio.sm0.set_enable(true);
 
     loop {
         led.set_low();
@@ -91,38 +95,32 @@ fn setup_7sd_task_sm0<'a, ST, SU, DT, DU>(pio: &mut Common<'a, PIO0>, sm: &mut S
     //         ".wrap",
     // );
 
-    // let prog = pio_proc::pio_asm!(
-    //     "start:",
-    //     "set y, 31",
-    //     "out pins, 1",
-    //     "inner_loop:",
-    //     "set x, 31"
-    //     "jmp y--, start"
-    //     ".wrap_target",
-    //     "jmp x--, inner_loop [31]",
-    //     ".wrap"
-    // );
+    let prog = pio_proc::pio_asm!(
+        ".wrap_target",
+        "set x, 31",
+        "out pins, 1",
+        "loop:"
+        "jmp x--, loop [31]",
+        ".wrap",
+    );
     
     // let segment_out = segment_pins.init_out(pio, sm);
     // let digit_out = digit_pins.init_out(pio, sm);
     // cfg.use_program(&pio.load_program(&prog.program), &[&digit_out.clock, &digit_out.data, &segment_out.clock]);
 
-    let prog = pio_proc::pio_asm!(
-        "set pins, 1",
-    );
 
     let out_pin = pio.make_pio_pin(segment_pins.data);
 
     let mut cfg = pio::Config::default();
     cfg.use_program(&pio.load_program(&prog.program), &[]);
-    cfg.clock_divider = (U56F8!(125_000_000) / 10_000).to_fixed();
+    cfg.clock_divider = (U56F8!(125_000_000) / U56F8!(10_000)).to_fixed();
     cfg.set_out_pins(&[&out_pin]);
-    cfg.shift_out.auto_fill = true;
+    cfg.shift_out = ShiftConfig {
+        auto_fill: true,
+        threshold: 32,
+        direction: ShiftDirection::Right,
+    };
 
+    sm.set_pin_dirs(pio::Direction::Out, &[&out_pin]);
     sm.set_config(&cfg);
-}
-
-#[embassy_executor::task]
-async fn pio_task_sm0(mut sm: StateMachine<'static, PIO0, 0>) {
-    sm.set_enable(true);
 }
