@@ -4,7 +4,7 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use embassy_executor::Spawner;
-use embassy_rp::{bind_interrupts, dma::{write_repeated, Channel, Transfer}, gpio, into_ref, peripherals::PIO0, pio::{self, Common, Instance, Pin, Pio, PioPin, ShiftConfig, ShiftDirection, StateMachine}, Peripheral};
+use embassy_rp::{bind_interrupts, dma::{self, read, write_repeated, Channel}, gpio, into_ref, peripherals::{DMA_CH0, DMA_CH1, PIO0}, pio::{self, Common, Instance, Pin, Pio, PioPin, ShiftConfig, ShiftDirection, StateMachine}, Peripheral};
 use embassy_time::Timer;
 use fixed_macro::types::U56F8;
 use gpio::{Level, Output};
@@ -17,6 +17,8 @@ bind_interrupts!(struct Irqs {
 });
 
 const SM0_TXF0: *mut u32 = 0x50200010 as *mut u32;
+static HAHA: u8 = 1;
+static mut OUTPUT: u32 = 0b10101010_10101010_10101010_10101010;
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -27,17 +29,50 @@ async fn main(_spawner: Spawner) {
     let segment_pins = UninitSerialPair { data: p.PIN_15, clock: p.PIN_14 };
     let digit_pins = UninitSerialPair { data: p.PIN_13, clock: p.PIN_12 };
     setup_7sd_task_sm0(&mut pio.common, &mut pio.sm0, segment_pins, digit_pins);
-    let silly = &[0b10101010101010101010101010101010u32];
 
-    unsafe { write_repeated(p.DMA_CH0, SM0_TXF0, 4, TreqSel::PERMANENT).; }
     pio.sm0.set_enable(true);
+
+    let dma0_number = p.DMA_CH0.number();
+    let ctrl_chan = init_ch(p.DMA_CH0, &raw const HAHA as *const u32, p.DMA_CH1.regs().al1_trans_count_trig().as_ptr(), DataSize::SIZE_BYTE, dma0_number, true);
+    init_ch(p.DMA_CH1, &raw mut OUTPUT as *const u32, SM0_TXF0, DataSize::SIZE_WORD, dma0_number, true);
+
+    ctrl_chan.regs().ctrl_trig().write(|t| t.set_en(true));
 
     loop {
         led.set_low();
-        Timer::after_millis(500).await;
+        Timer::after_millis(900).await;
         led.set_high();
-        Timer::after_millis(500).await;
+        Timer::after_millis(100).await;
     }
+}
+
+fn init_ch<C: Channel>(
+    ch: C,
+    from: *const u32,
+    to: *mut u32,
+    datasize: DataSize,
+    chain_to: u8,
+    quiet: bool,
+) ->  C {
+    let p = ch.regs();
+
+    p.read_addr().write_value(from as u32);
+    p.write_addr().write_value(to as u32);
+    p.trans_count().write_value(1);
+
+    compiler_fence(Ordering::SeqCst);
+
+    p.ctrl_trig().write(|w| {
+        w.set_treq_sel(TreqSel::PERMANENT);
+        w.set_data_size(datasize);
+        w.set_incr_read(false);
+        w.set_incr_write(false);
+        w.set_chain_to(chain_to);
+        w.set_irq_quiet(quiet);
+    });
+
+    compiler_fence(Ordering::SeqCst);
+    ch
 }
 
 struct UninitSerialPair<T, U>

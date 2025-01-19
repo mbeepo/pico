@@ -20,3 +20,4 @@ embassy-sync = "0.6.1"
 fixed-macro = "1.2.0"
 fixed = "1.28.0"
 rp-pac = {version = "7.0.0", features = ["rp2040"] }
+embassy-futures = "0.1.1"
