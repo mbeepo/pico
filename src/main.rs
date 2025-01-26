@@ -22,7 +22,7 @@ bind_interrupts!(struct Irqs {
 const SM0_TXF0: *mut u32 = 0x50200010 as *mut u32;
 
 static HAHA: u32 = 1;
-static mut OUTPUT: u32 = 0b10000000_10000000_10000000_10000000;
+static mut OUTPUT: u32 = 0b10101010_10101010_10101010_10101010;
 // static mut OUTPUT: u32 = u32::MAX;
 
 static mut CORE1_STACK: Stack<4096> = Stack::new();
